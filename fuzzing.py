@@ -1,40 +1,25 @@
+from pathlib import Path
 import shlex
 import re
 import random
 import os
 import argparse
 import json
-import sqlite3
 import traceback
-
-# Load environment variables from .env file
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    print("[!] python-dotenv not installed. Install with: pip install python-dotenv")
-
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-
+import yaml
+import requests
 from queue import Queue
-
 from classification import *
-#from database import *
 from mutate_logic import *
 from execute import ExecuteAgent
 from zircolite import ZircoliteAgent
+from llm import generate_json_with_model, get_potential_bypass_cmd_with_model
 import time
+import sys
 
 # --- 1. CONFIGURATION & REGEX ---
-
-#DB_FILE = "../fuzzer_tokens.db"
-SEEDS_DIR = "seeds"   # Thư mục chứa các file input
-OUT_DIR = "out"       # Thư mục chứa các file output
-
+SEEDS_DIR = "seeds"  
+OUT_DIR = "out"      
 JSON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "context")
 ZIRCOLITE_DETECTED_EVENTS = "../detected_events.json"
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -44,9 +29,11 @@ cache = {}
 exec_list = list()
 seed_queue = Queue()
 execute_queue = Queue()
+rule_filename_to_title = {}  # Global dictionary to map filenames to rule titles
 
 #LOGIC FUNCTIONS
 def get_exec_list():
+    global exec_list
     try:
         with open(os.path.join(JSON_DIR, "exec_list.txt"), "r") as f:
             exec_list = f.readlines()
@@ -54,125 +41,51 @@ def get_exec_list():
     except:
         return
 
-def generate_json_with_gemini(exec_name):
+def countdown_sleep(seconds, label="Waiting"):
     """
-    Use Gemini AI to generate JSON file with executable flags/arguments.
-    Returns dict with argument_dict, switch_dict, cmd_dict structure.
+    Sleep for specified seconds with a countdown display.
+    
+    Args:
+        seconds: Number of seconds to wait
+        label: Description of what we're waiting for
     """
-    if not GEMINI_AVAILABLE:
-        print(f"[!] Gemini API not available for {exec_name}")
-        return [dict(), dict(), dict()]
+    print(f"\n[*] {label} for {seconds} seconds...")
+    for remaining in range(seconds, 0, -1):
+        mins, secs = divmod(remaining, 60)
+        time_str = f"{mins:02d}:{secs:02d}"
+        sys.stdout.write(f"\r[*] Time remaining: {time_str} ({remaining}s)  ")
+        sys.stdout.flush()
+        time.sleep(1)
+    print("\n[✓] Done waiting!\n")
+
+def load_rule_filename_mapping():
+    """
+    Load the rule filename to title mapping from JSON file.
+    Populates the global rule_filename_to_title dictionary.
+    """
+    global rule_filename_to_title
+    
+    mapping_file = os.path.join(script_dir, "rule_filename_to_title.json")
     
     try:
-        prompt = f"""
-        Generate a JSON file for the Windows/Linux command '{exec_name}' with the following structure:
-        {{
-            "-flag1": ["alias_for_flag1", "Argument"],
-            "-flag2": ["alias_for_flag2", "Switch"],
-            "subcommand": ["alias", "Subcommand"],
-            "_meta": {{
-                "name": "{exec_name}",
-                "type": "executable"
-            }}
-        }}
-        
-        Where:
-        - "Argument" means the flag takes a value
-        - "Switch" means the flag is a boolean toggle
-        - "Subcommand" means it's a subcommand
-        
-        Return ONLY the JSON object, no additional text.
-
-        Example output:
-        {{
-    "_meta": {{
-        "executable": "esentutl.exe",
-        "category": "Credential_Access_and_LOLBAS",
-        "description": "Extensible Storage Engine Utilities. Frequently abused by threat actors to copy locked system files (like ntds.dit or SAM hives) using Volume Shadow Copies."
-    }},
-    "/y": ["-y", "Argument"],
-    "-y": ["/y", "Argument"],
-    "/d": ["-d", "Argument"],
-    "-d": ["/d", "Argument"],
-    "/vss": ["-vss", "Switch"],
-    "-vss": ["/vss", "Switch"],
-    "/vssrec": ["-vssrec", "Switch"],
-    "-vssrec": ["/vssrec", "Switch"],
-    "/r": ["-r", "Argument"],
-    "-r": ["/r", "Argument"],
-    "/p": ["-p", "Argument"],
-    "-p": ["/p", "Argument"],
-    "/m": ["-m", "Argument"],
-    "-m": ["/m", "Argument"],
-    "/g": ["-g", "Argument"],
-    "-g": ["/g", "Argument"],
-    "/c": ["-c", "Argument"],
-    "-c": ["/c", "Argument"],
-    "/o": ["-o", "Switch"],
-    "-o": ["/o", "Switch"],
-    "/8": ["-8", "Argument"],
-    "-8": ["/8", "Argument"]
-}}
-        """
-        
-        model = genai.GenerativeModel('models/gemini-2.5-flash')
-        response = model.generate_content(prompt)
-        
-        # Parse the response
-        response_text = response.text.strip()
-        # Remove markdown code blocks if present
-        if response_text.startswith('```'):
-            response_text = response_text.split('```')[1]
-            if response_text.startswith('json'):
-                response_text = response_text[4:]
-        if response_text.endswith('```'):
-            response_text = response_text[:-3]
-        
-        data = json.loads(response_text)
-
-        argument_dict = dict()
-        switch_dict = dict()
-        cmd_dict = dict()
-
-        for flag in data:
-            if flag == "_meta":
-                continue
-            info = data[flag]
-            if info[1] == "Argument":
-                argument_dict[flag] = info[0]
-            elif info[1] == "Switch":
-                switch_dict[flag] = info[0]
-            elif info[1] == "Subcommand":
-                cmd_dict[flag] = info[0]
-
-        
-        # Save to file
-        output_path = os.path.join(JSON_DIR, f"{os.path.basename(exec_name).split('.')[0].lower()}.json")
-        with open(output_path, 'w') as f:
-            json.dump(data, f, indent=2)
-        print(f"[+] Generated and saved JSON for {exec_name}")
-
-        cleaned_exec_name = os.path.basename(exec_name).split('.')[0].lower()
-        exec_list_path = os.path.join(JSON_DIR, "exec_list.txt")
-        with open(exec_list_path, 'a') as f:
-            f.write(f"{cleaned_exec_name}\n")
-        
-        exec_list.append(cleaned_exec_name)
-
-        return argument_dict, switch_dict, cmd_dict
-    
+        if os.path.exists(mapping_file):
+            with open(mapping_file, 'r', encoding='utf-8') as f:
+                rule_filename_to_title = json.load(f)
+            print(f"[+] Loaded {len(rule_filename_to_title)} rule mappings from {mapping_file}")
+        else:
+            print(f"[!] Warning: {mapping_file} not found. Run parse.py to generate it.")
+            rule_filename_to_title = {}
     except Exception as e:
-        print(f"[!] Error generating JSON with Gemini for {exec_name}: {e}")
-        return
+        print(f"[!] Error loading rule filename mapping: {e}")
+        rule_filename_to_title = {}
+
 
 def get_dict_by_json(exec_name):
     
-    # Get just the filename without path
     exec_basename = os.path.basename(exec_name)
     exec_name_clean = os.path.splitext(exec_basename)[0]
     norm_exec_name = exec_name_clean.lower()
     
-    # Clean up invalid characters
     norm_exec_name = re.sub(r'[<>:"|?*\s]', '', norm_exec_name)
     
     if not norm_exec_name:
@@ -191,7 +104,6 @@ def get_dict_by_json(exec_name):
                     if flag == "_meta":
                         continue
                     info = data[flag]
-
                     if info[1] == "Argument":
                         argument_dict[flag] = info[0]
                     elif info[1] == "Switch":
@@ -200,8 +112,8 @@ def get_dict_by_json(exec_name):
                         cmd_dict[flag] = info[0]
 
         except FileNotFoundError:
-            print(f"[*] JSON file not found for {norm_exec_name}, attempting to generate with Gemini...")
-            argument_dict, switch_dict, cmd_dict = generate_json_with_gemini(norm_exec_name)
+            print(f"[*] JSON file not found for {norm_exec_name}, attempting to generate with model...")
+            argument_dict, switch_dict, cmd_dict = generate_json_with_model(norm_exec_name, exec_list)
         except Exception as e:
             print(f"[!] Error reading JSON for {norm_exec_name}: {e}")
         
@@ -209,13 +121,23 @@ def get_dict_by_json(exec_name):
         cache[norm_exec_name] = [argument_dict, switch_dict, cmd_dict]
            
 
-def fuzzing(seed, target_count=10, max_attempts=10, verbose=False): 
+def fuzzing(seed_obj, target_count=5, max_attempts=10, verbose=False): 
+    """
+    Mutate a seed command. 
+    seed_obj can be either a string (for backwards compatibility) or a dict with 'command' and 'rule_title' keys.
+    """
+    # Handle both string and dict seed formats
+    if isinstance(seed_obj, dict):
+        seed = seed_obj.get('command', '')
+        rule_title = seed_obj.get('rule_title', 'unknown')
+    else:
+        seed = seed_obj
+        rule_title = 'unknown'
   
     unique_mutated_commands = set()
     unique_mutated_commands.add(seed) 
     mutated_commands_ordered = []
     mutated_commands_ordered.append(seed)
-
     """
     Assume that the first token in every seed command is the executable path/name
     Check if the list of argument for that executable has been stored in cache.
@@ -236,6 +158,7 @@ def fuzzing(seed, target_count=10, max_attempts=10, verbose=False):
     if norm_exec_name not in cache:
         try:
             get_dict_by_json(norm_exec_name)
+            exec_list.append(norm_exec_name)
         except:
             cache[norm_exec_name] = [list(), list(), list()]
     
@@ -244,7 +167,7 @@ def fuzzing(seed, target_count=10, max_attempts=10, verbose=False):
         print(f"Parsed command with argparse: {parsed}")
 
     # 1. Classify
-    argument_dict, switch_dict, cmd_dict = cache[norm_exec_name]  
+    argument_dict, switch_dict, cmd_dict = cache[norm_exec_name]
     classified_tokens = []
     for tok in original_tokens:
         tok_type = classify_token(tok)
@@ -260,6 +183,8 @@ def fuzzing(seed, target_count=10, max_attempts=10, verbose=False):
 
             if norm_tok in exec_list:
                 tok_type = "executable_name"
+            elif norm_tok in argument_dict or norm_tok in switch_dict or norm_tok in cmd_dict:
+                tok_type = "flag"
         
         if tok_type: 
             classified_tokens.append((tok, tok_type))
@@ -273,26 +198,42 @@ def fuzzing(seed, target_count=10, max_attempts=10, verbose=False):
         
         for original_token, token_type in classified_tokens:
             mutated_token = original_token
-            rand = random.randint(0, 100)
 
-            # --- ALGORITHM: 35/30/35 for Executables ---
-            if token_type == "executable_name":
-                if rand < 65: 
-                    mutated_token = obfuscate_executable(original_token)
-            
-            # --- ALGORITHM: 5/55/30/20 for Flags ---
-            elif token_type == "flag":
-                if rand < 20: 
-                    mutated_token = randomize_case(original_token, token_type)
-                elif rand < 70: 
-                    mutated_token = obfuscate_flag(original_token)
+            if token_type == "flag":
+                
+                if original_token in argument_dict:
+                    mutated_token = argument_dict[original_token]
+                    rand = random.randint(0, 2)
+                    match rand:
+                        case 0:
+                            mutated_token = randomize_case(original_token, token_type)
+                        case 1:
+                            mutated_token = obfuscate_flag(original_token)
+                        
+                elif original_token in switch_dict:
+                    mutated_token = switch_dict[original_token]
+                    rand = random.randint(0, 2)
+                    match rand:
+                        case 0:
+                            mutated_token = randomize_case(original_token, token_type)
+                        case 1: 
+                            mutated_token = obfuscate_flag(original_token)
+
+                elif original_token in cmd_dict:
+                    mutated_token = cmd_dict[original_token]
+                    rand = random.randint(0, 2)
+                    match rand:
+                        case 0:
+                            mutated_token = obfuscate_subcommand(mutated_token)
+                        case 1:
+                            mutated_token = randomize_case(mutated_token, token_type)
                 else:
-                    if original_token in argument_dict:
-                        mutated_token = argument_dict[original_token]
-                    elif original_token in switch_dict:
-                        mutated_token = switch_dict[original_token]
-                    elif original_token in cmd_dict:
-                        mutated_token = cmd_dict[original_token]
+                    rand = random.randint(0, 2)
+                    match rand:
+                        case 0:
+                            mutated_token = obfuscate_flag(original_token)
+                        case 1:
+                            mutated_token = randomize_case(mutated_token, token_type)
             
             elif token_type == "cmd":
                 unquoted_token = original_token.strip('"\'')
@@ -303,15 +244,15 @@ def fuzzing(seed, target_count=10, max_attempts=10, verbose=False):
                     mutated_token = original_token
 
             else:
-                if should_randomize_case(token_type, original_token) and rand <= 50:  # 5-30: case mutation for strings
-                    mutated_token = randomize_case(original_token, token_type)
+                rand = random.randint(0, 2)
+                match rand:
+                    case 0:
+                        mutated_token = randomize_case(original_token, token_type)
+                    case 1:
+                        mutated_token = obfuscate_subcommand(mutated_token) #borrow a little bit from subcommand, no prob
 
             new_token_list.append(mutated_token)
-        
-        # Apply noise flag (Removed, seem useless)
-        #if random.random() < 0.5:
-            #new_token_list = add_noise_flags(new_token_list, switch_dict)
-         
+
         final_command = " ".join(
             f'"{tok}"' if " " in str(tok) and not (str(tok).startswith('"') and str(tok).endswith('"')) else str(tok) 
             for tok in new_token_list
@@ -335,7 +276,15 @@ def execute(shell='powershell', timeout=10):
 
     curr_batch_length = execute_queue.qsize()
     for i in range(curr_batch_length):
-        command = execute_queue.get()
+        command_obj = execute_queue.get()
+        # Handle both string and dict formats
+        if isinstance(command_obj, dict):
+            command = command_obj.get('command', '')
+            rule_title = command_obj.get('rule_title', 'unknown')
+        else:
+            command = command_obj
+            rule_title = 'unknown'
+        
         result = agent.execute_command(command)
         
         # Check for syntax errors in stderr
@@ -373,10 +322,10 @@ def execute(shell='powershell', timeout=10):
         
         # Only push back and collect result if no syntax error
         if not has_syntax_error:
-            execute_queue.put(command)
+            execute_queue.put({'command': command, 'rule_title': rule_title})
             all_result.append(result)
         else:
-            print(f"Removed commands: {command}")
+            print(f"Removed commands: {command} (Rule: {rule_title})")
     
     return all_result
 
@@ -392,170 +341,143 @@ def zircolite_check(
     """
 
     rules_dir_path = os.path.normpath(os.path.join(script_dir, rules_dir))
-    #events_dir_path = os.path.normpath(os.path.join(script_dir, events_dir))
     zircolite_path_abs = os.path.normpath(os.path.join(script_dir, zircolite_path))
     output_dir_path = os.path.normpath(os.path.join(script_dir, output_dir))
     
-    # Create output directory if not exists
     if not os.path.exists(output_dir_path):
         os.makedirs(output_dir_path)
         print(f"[*] Created output directory '{output_dir}'")
-    
-    # Check if rules directory exists
     if not os.path.exists(rules_dir_path):
         print(f"[!] Error: Rules directory '{rules_dir}' not found.")
         return None
-    
-    # Check if events directory exists
-    #if not os.path.exists(events_dir_path):
-        #print(f"[!] Error: Events directory '{events_dir}' not found.")
-        #return None
-    
-    # Get all event files
-    #event_files = [f for f in os.listdir(events_dir_path) if f.endswith(('.json', '.jsonl', '.log'))]
-    
     if not events_file:
         print(f"[!] No event files found in '{events_file}'.")
         return None
-    
-    #print(f"[*] Found {len(event_files)} event file(s). Starting Zircolite detection...")
     print(f"[*] Using Sigma rules from: {rules_dir_path}")
-    
-    # Initialize ZircoliteAgent
     agent = ZircoliteAgent(
         rules_dir=rules_dir_path,
         events_dir=events_file,
         zircolite_path=zircolite_path_abs,
         output_dir=output_dir_path
     )
-    
-    # Full paths to event files
-    #event_file_paths = [os.path.join(events_dir_path, f) for f in event_files]
-    
-    # Run batch analysis
-    #summary = agent.analyze_batch(event_file_paths)
-
     summary = agent.check_events(events_file)
-    
     return summary
 
 #fuzzing loop: get seed from queue -> mutate -> execute batch -> zircolite check -> select successful bypass seed
 def fuzzing_loop():
     try:
-        #temporary 5 loops first hehe
-        loop = 0
         while True:
-            loop = loop + 1
-            #Push curr_seed to back of the queue
             if seed_queue.qsize() == 0:
                 raise KeyboardInterrupt
-            
-            if loop > 5:
-                raise KeyboardInterrupt
+            curr_seed_obj = seed_queue.get()
 
-            curr_seed = seed_queue.get()
-            seed_queue.put(curr_seed)
-
-            mutated_command = fuzzing(curr_seed)
-            
+            if isinstance(curr_seed_obj, dict):
+                curr_seed = curr_seed_obj.get('command', '')
+                rule_filename = curr_seed_obj.get('rule_filename', 'unknown')
+                rule_title = rule_filename_to_title.get(f"{rule_filename}.yml", "unknown")
+            else:
+                curr_seed = curr_seed_obj
+                rule_filename = 'unknown'
+            mutated_command = fuzzing(curr_seed_obj)
             for command in mutated_command:
-                execute_queue.put(command)
-            
-            all_result = execute()
-
+                execute_queue.put({'command': command, 'rule_title': rule_title})  
+            execute()
             #Waiting for Sysmon to logs all events....
-            time.sleep(5)
+            countdown_sleep(100, "Waiting for Sysmon to log all events")
 
             zircolite_check()
 
-            captured_commands = list()
-            with open(os.path.join(script_dir, ZIRCOLITE_DETECTED_EVENTS), "r") as f:
+            # Build a mapping of commands to the rules that detected them
+            command_rule_map = {}  # {command: [rule_title, ...]}
+
+            with open(os.path.join(script_dir, ZIRCOLITE_DETECTED_EVENTS), "r", encoding='utf-8', errors='replace') as f:
                 rules_triggered = json.load(f)
 
             for rule in rules_triggered:
+                rule_title = rule.get("title", "unknown")
                 matches = rule.get("matches", [])
                 for match in matches:
                     command_line = match.get("CommandLine")
                     if command_line:
-                        captured_commands.append(command_line)
+                        if command_line not in command_rule_map:
+                            command_rule_map[command_line] = []
+                        if rule_title not in command_rule_map[command_line]:
+                            command_rule_map[command_line].append(rule_title)
                     parent_cmdline = match.get("ParentCommandLine")
                     if parent_cmdline:
-                        captured_commands.append(parent_cmdline)
+                        if parent_cmdline not in command_rule_map:
+                            command_rule_map[parent_cmdline] = []
+                        if rule_title not in command_rule_map[parent_cmdline]:
+                            command_rule_map[parent_cmdline].append(rule_title)
             
-            with open('captured.txt', 'a')  as f:
-                f.write('\n'.join(cmd for cmd in captured_commands))
+            with open('captured.txt', 'a', encoding="utf-8")  as f:
+                for cmd, rules in command_rule_map.items():
+                    f.write(f"{cmd}\t# Rules: {','.join(rules)}\n")
 
             curr_batch_length = execute_queue.qsize()
 
-            for i in range(curr_batch_length):
-                curr_command = execute_queue.get()
-                captured = False
-
-                if curr_command in captured_commands:
-                    captured = True
-                    print(f"Captured command {curr_command} in command-lines")
-                    continue
-
-                for captured_command in captured_commands:
-                    if curr_command in captured_command:
-                        captured = True
-                        print(f"Captured command {curr_command} in command-line {captured_command}")
-                        break
-                if captured == False:
-                    seed_queue.put(curr_command)
+            bypassed_commands = []
+            captured_commands = []    
             
-            print("\n[*] Saving seeds to file...")
-            commands_by_exec = {}
-
-            curr_seed_size = seed_queue.qsize()
-
-            for i in range(curr_seed_size):
-                command = seed_queue.get()
-                seed_queue.put(command) #Pop and push back to queue
-                try:
-                    tokens = shlex.split(command, posix=False)
-                    if tokens:
-                        exec_token = tokens[0]
-                        exec_basename = os.path.basename(exec_token)
-                        exec_name = os.path.splitext(exec_basename)[0].lower()
-                        print(f"Found {exec_name} for command {command}")
-                    else:
-                        exec_name = "unknown"
-                except:
-                    exec_name = "unknown"
-
-                if exec_name not in commands_by_exec:
-                    commands_by_exec[exec_name] = []
-                commands_by_exec[exec_name].append(command)
+            for i in range(curr_batch_length):
+                curr_command_obj = execute_queue.get()
+                
+                # Handle both string and dict formats
+                if isinstance(curr_command_obj, dict):
+                    curr_command = curr_command_obj.get('command', '')
+                    rule_title = curr_command_obj.get('rule_title', 'unknown')
+                else:
+                    curr_command = curr_command_obj
+                    rule_title = 'unknown'
+                captured = False
+                # Check if the command was captured by the exact rule specified in seed_obj
+                if curr_command in command_rule_map:
+                    if rule_title in command_rule_map[curr_command]:
+                        captured = True
+                        print(f"[LOG] Captured command {curr_command} by rule '{rule_title}'")
+                        continue
+                # Also check if command is substring of any captured command by the correct rule
+                for captured_command, rules_that_matched in command_rule_map.items():
+                    if rule_title in rules_that_matched and curr_command in captured_command:
+                        captured = True
+                        print(f"[LOG] Captured command {curr_command} in command-line {captured_command} (Rule: {rule_title})")
+                        break   
+                if captured == False:
+                    bypassed_commands.append(curr_command)
+                else:
+                    captured_commands.append(curr_command)
+            
+            print("\n[*] Saving seeds for current rule to file...")
+            
     
-            # Write grouped commands to files
-            if commands_by_exec:
+            # Write commands only for current rule to file
+            if len(bypassed_commands) > 0:
                 out_dir_path = os.path.join(script_dir, OUT_DIR)
                 if not os.path.exists(out_dir_path):
                     os.makedirs(out_dir_path)
-        
-                for exec_name, commands in commands_by_exec.items():
-                    output_file = os.path.join(out_dir_path, f"seed_{exec_name}.txt")
-                    try:
-                        with open(output_file, 'w', encoding='utf-8') as f:
-                            for command in commands:
-                                f.write(command + '\n')
-                        print(f"[*] Saved {len(commands)} commands for '{exec_name}' to {output_file}")
-                    except Exception as e:
-                        print(f"[!] Error saving commands for '{command}': {e}")
+
+                safe_rule_name = re.sub(r'[<>:"|?*\\/]', '_', rule_filename)
+                output_file = os.path.join(out_dir_path, f"seed_{safe_rule_name}.txt")
+                try:
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        for cmd in bypassed_commands:
+                            f.write(f"{cmd}\n")
+                    print(f"[*] Saved {len(bypassed_commands)} commands for rule '{rule_filename}' to {output_file}")
+                except Exception as e:
+                    print(f"[!] Error saving commands for rule '{rule_title}': {e}")
             else:
-                print("[*] No commands to save.")
+                print(f"[*] No commands to save for rule '{rule_title}'.")
+                print(f"[*] Chatting with LLM for potential bypass commands...")
+                new_command = get_potential_bypass_cmd_with_model(rule_filename, captured_commands)
+                seed_queue.push({"command": new_command, "rule_filename":rule_filename})
+
     
     except KeyboardInterrupt:
-        print("\n[*] Fuzzing loop interrupted by user (Ctrl+C). Exiting gracefully...")
+        print("\n[*] Fuzzing loop done. Exiting gracefully...")
     except Exception as e:
         print(f"[!] Error in fuzzing loop: {e}")
         traceback.print_exc()
-    
-    # Save all commands in seed_queue grouped by executable name
-    
-   
-   
+
 def main():
     parser = argparse.ArgumentParser(description="Fuzz command seeds using token-based mutations.")
     parser.add_argument('--seeds-dir', default=SEEDS_DIR, help=f"Directory containing seed files (default: {SEEDS_DIR})")
@@ -566,15 +488,15 @@ def main():
     parser.add_argument('--verbose', action='store_true', help="Enable verbose output")
     
     args = parser.parse_args()
-    
-    #conn, cursor = sqlite_connect()
 
     #INITIALIZATION
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     seeds_dir_path = os.path.join(script_dir, args.seeds_dir)
     out_dir_path = os.path.join(script_dir, args.out_dir)
-    # Kiểm tra/Tạo thư mục
+
+    load_rule_filename_mapping()
+
     if not os.path.exists(seeds_dir_path):
         print(f"[!] Error: Seeds directory '{args.seeds_dir}' not found.")
         return
@@ -583,18 +505,47 @@ def main():
         os.makedirs(out_dir_path)
         print(f"[*] Created output directory '{args.out_dir}'")
 
-    # Lấy danh sách file seeds
-    seed_files = [f for f in os.listdir(seeds_dir_path) if f.endswith(".txt")]
-    if not seed_files:
-        print(f"[!] No .txt files found in '{SEEDS_DIR}'.")
-        return
-    print(f"[*] Found {len(seed_files)} seed files. Starting batch processing...")
-
-    #Get executable list
-    exec_list = get_exec_list()
+    # Look for both .json and .txt seed files
+    seed_files_json = [f for f in os.listdir(seeds_dir_path) if f.endswith(".json")]
+    seed_files_txt = [f for f in os.listdir(seeds_dir_path) if f.endswith(".txt")]
     
-    # Duyệt qua từng file
-    for filename in seed_files:
+    if not seed_files_json and not seed_files_txt:
+        print(f"[!] No .json or .txt files found in '{SEEDS_DIR}'.")
+        return
+    
+    print(f"[*] Found {len(seed_files_json)} JSON seed files and {len(seed_files_txt)} TXT seed files. Starting batch processing...")
+    
+    # Process JSON files
+    for filename in seed_files_json:
+        input_path = os.path.join(seeds_dir_path, filename)
+        print(f"\n---> Processing JSON: {filename}")
+        
+        try:
+            with open(input_path, 'r', encoding='utf-8') as f:
+                seed_data = json.load(f)
+            
+            # seed_data should be a list of dicts with 'title' and 'commands' keys
+            if isinstance(seed_data, list):
+                for item in seed_data:
+                    if isinstance(item, dict):
+                        rule_filename = item.get('filename', 'unknown')
+                        commands = item.get('commands', [])
+                        
+                        if isinstance(commands, list):
+                            for command in commands:
+                                if command and isinstance(command, str) and not command.strip().startswith('#'):
+                                    seed_obj = {
+                                        'command': command.strip(),
+                                        'rule_filename': rule_filename
+                                    }
+                                    seed_queue.put(seed_obj)
+                                    print(f"  Added seed: {command.strip()} (Rule: {rule_filename})")
+        except Exception as e:
+            print(f"[!] Error reading JSON file {filename}: {e}")
+            continue
+    
+    # Process TXT files (backwards compatibility)
+    for filename in seed_files_txt:
         input_path = os.path.join(seeds_dir_path, filename)
         match = re.search(r'(\d+)', filename)
         if match:
@@ -603,22 +554,24 @@ def main():
             out_filename = f"result_{filename}"
             
         output_path = os.path.join(out_dir_path, out_filename)
-        
-        print(f"\n---> Processing: {filename} -> {out_filename}")
-        
-        with open(input_path, 'r', encoding='utf-8') as f:
-            seeds = [line.strip() for line in f if line.strip() and not line.startswith('#')]
- 
-            for seed in seeds:
-                seed_queue.put(seed)
+        print(f"\n---> Processing TXT: {filename} -> {out_filename}")
+        try:
+            with open(input_path, 'r', encoding='utf-8') as f:
+                seeds = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                for seed in seeds:
+                    seed_obj = {
+                        'command': seed,
+                        'rule_filename': filename  # Use filename as rule title for txt files
+                    }
+                    seed_queue.put(seed_obj)
+        except Exception as e:
+            print(f"[!] Error reading TXT file {filename}: {e}")
+            continue
 
-    
     #FUZZING LOOP
-
     fuzzing_loop()
 
     print(f"\n[*] All done! Check the '{OUT_DIR}' folder.")
-
 
 
 if __name__ == "__main__":

@@ -1,17 +1,23 @@
 import random
 
+char_mapping = {
+    'a': 'ᵃ', 'b': 'ᵇ', 'c': 'ᶜ', 'd': 'ᵈ', 'e': 'ᵉ', 'f': 'ᶠ',
+    'g': 'ᵍ', 'h': 'ʰ', 'i': 'ⁱ', 'j': 'ʲ', 'k': 'ᵏ', 'l': 'ˡ',
+    'm': 'ᵐ', 'n': 'ⁿ', 'o': 'ᵒ', 'p': 'ᵖ', 'q': 'ᵍ', 'r': 'ʳ',
+    's': 'ˢ', 't': 'ᵗ', 'u': 'ᵘ', 'v': 'ᵛ', 'w': 'ʷ', 'x': 'ˣ',
+    'y': 'ʸ', 'z': 'ᶻ'
+}
+
 def randomize_case(token, token_type):
     """
     Randomize the case of a token
     """
-
     #mutate url scheme
     if token_type == 'url':
         pos = token.find("://")
         mutated_part = token[:pos]
         keep_part = token[pos:]
-        mutated = ''.join(c.upper() if random.random() > 0.5 else c.lower() for c in mutated_part)
-        token = mutated + keep_part
+        token = mutated_part + keep_part
         return token
 
     return ''.join(c.upper() if random.random() > 0.5 else c.lower() for c in token)
@@ -20,8 +26,7 @@ def should_randomize_case(token_type, token):
     """
     Determine if a token should be case-mutated 
     """
-    case_mutable_types = ['executable_name', 'flag', 'ps_var', 'env', 'operator', 'url', 'subcommand']
-   
+    case_mutable_types = ['executable_name', 'flag', 'ps_var', 'env', 'operator', 'url', 'subcommand', 'literal']
     if token and (token[0].isalpha() or token[0] in ['-', '/']):
         return token_type in case_mutable_types
     return False
@@ -32,44 +37,70 @@ def obfuscate_flag(flag):
     """
     if not flag:
         return flag
-    
     # Handle flags starting with - or /
     if flag[0] in ['-', '/']:
-        prefix = flag[0]
+        if flag[0] == '-':
+            prefix = "/"
+        elif flag[1] == '/':
+            prefix = '-'
         rest = flag[1:]
-        return f'{prefix}"{rest}"'
+
+        if rest[0] != "\"":
+            return f'{prefix}"{rest}"'
+        #do not wrap tons of quotes
+        return f'{prefix}{rest}'
     
     return flag
 
+def replace_with_spacing_modifier(char):
+    """
+    Replace a character with a spacing modifier letter (Unicode 0x02B0-0x02FF range).
+    Returns original character followed by a random spacing modifier.
+    """
+    return char_mapping.get(char, char)
 
-def add_noise_flags(tokens, noise_dict):
-    """
-    Add benign switch flags
-    """
-    if not tokens or not noise_dict or random.random() > 0.3:  # 30% probability
-        return tokens
-    
-    noise = random.choice(list(noise_dict.keys()))
-    
-    # Insert noise flag
-    new_tokens = [tokens[0]]
-    if len(noise) > 0:
-        new_tokens.append(noise)
-    new_tokens.extend(tokens[1:])
-    return new_tokens
 
-def obfuscate_executable(executable):
+def obfuscate_subcommand(flag):
     """
-    Obfuscate executable names to evade SIEM detection.
+    Obfuscate a subcommand token by randomly joining with carets (^) or wrapping random characters with quotes
     """
-    # 4 obfuscation methods applicable to all executables
-    obfuscation_methods = [
-        #lambda x: '^'.join(x),  # c^a^l^c or p^o^w^e^r^s^h^e^l^l
-        #lambda x: f'%COMSPEC% /c "{x}"',  # Wrap in cmd /c
-        lambda x: randomize_case(x, "executable"),  # CaLc or PoWeRsHeLL
-        lambda x: f'%SystemRoot%\\System32\\{x}',  # Add System32 path
-    ]
-    
-    method = random.choice(obfuscation_methods)
-    return method(executable)
+    forbidden_next_chars = ['n', 'r', 't', 'a', 'b', 'f', 'v', '0', '"', "'", '$']
+
+    if random.random() > 0.5:
+        # Join with carets
+        return "^".join(flag)
+    else:
+        # Wrap random characters with double quotes
+        result = []
+        backtick = False
+        length = len(flag)
+        for i in range(0, length):
+
+            char = flag[i]
+            #last character and backtick not closed yet
+            if backtick == True and i == length - 1:
+                result.append(f"{char}`")
+                backtick = False
+                continue
+            
+            rand = random.randint(0, 3)
+            match rand:
+                case 0:
+                    result.append(f'"{char}"')
+                case 1:
+                    result.append(replace_with_spacing_modifier(char))
+                case 2:
+                    if char not in forbidden_next_chars and i < (length - 1) and backtick == False:
+                        result.append(f"`{char}")
+                        backtick = True
+                    elif backtick == True: #close backtick
+                        result.append(f"{char}`")
+                        backtick = False
+                    else:
+                        result.append(char)
+                case _:
+                    result.append(char)
+        
+        
+        return ''.join(result)
 
