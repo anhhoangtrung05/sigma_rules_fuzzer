@@ -474,54 +474,7 @@ def fuzzing_loop():
             new_command = get_potential_bypass_cmd_with_model(rule_filename, captured_commands)
             seed_queue.put({"command": new_command, "rule_filename":rule_filename})
 
-        CSV_RULE_COL    = "target_rule"
-    CSV_CMD_COL     = "commandline"
-
-    for filename in seed_files_csv:
-        input_path = os.path.join(seeds_dir_path, filename)
-        print(f"\n---> Processing CSV: {filename}")
-        added = 0
-        try:
-            with open(input_path, 'r', encoding='utf-8-sig') as f:  # utf-8-sig strips BOM if present
-                reader = csv.DictReader(f)
-
-                # Validate that the required columns are present
-                if reader.fieldnames is None:
-                    print(f"[!] CSV file '{filename}' appears to be empty — skipping.")
-                    continue
-
-                missing = {CSV_RULE_COL, CSV_CMD_COL} - {c.strip() for c in reader.fieldnames}
-                if missing:
-                    print(f"[!] CSV file '{filename}' is missing required column(s): "
-                          f"{missing}. Found: {reader.fieldnames} — skipping.")
-                    continue
-
-                for row_num, row in enumerate(reader, start=2):  # start=2 because row 1 is the header
-                    rule_filename = (row.get(CSV_RULE_COL) or "").strip()
-                    command      = (row.get(CSV_CMD_COL)   or "").strip()
-
-                    if not command:
-                        print(f"  [!] Row {row_num}: empty '{CSV_CMD_COL}' — skipping.")
-                        continue
-                    if not rule_filename:
-                        print(f"  [!] Row {row_num}: empty '{CSV_RULE_COL}' — skipping.")
-                        continue
-                    if command.startswith('#'):
-                        continue  # treat lines commented-out in the CSV the same as in TXT files
-
-                    seed_obj = {
-                        'command':       command,
-                        'rule_filename': rule_filename,
-                    }
-                    seed_queue.put(seed_obj)
-                    print(f"  Added seed: {command} (Rule: {rule_filename})")
-                    added += 1
-
-            print(f"[+] {added} seed(s) loaded from '{filename}'.")
-
-        except Exception as e:
-            print(f"[!] Error reading CSV file {filename}: {e}")
-            continue
+        
     
     except KeyboardInterrupt:
         print("\n[*] Fuzzing loop done. Exiting gracefully...")
