@@ -136,21 +136,7 @@ def generate_json_with_model(exec_name, exec_list):
     print("[DEBUG] Generating executable dictionary with model.....")
     try:
         prompt = f"""
-        Generate a JSON file for the Windows/Linux command '{exec_name}' with the following structure:
-        {{
-            "-flag1": ["alias_for_flag1", "Argument"],
-            "-flag2": ["alias_for_flag2", "Switch"],
-            "subcommand": ["alias", "Subcommand"],
-            "_meta": {{
-                "name": "{exec_name}",
-                "type": "executable"
-            }}
-        }}
-        
-        Where:
-        - "Argument" means the flag takes a value
-        - "Switch" means the flag is a boolean toggle
-        - "Subcommand" means it's a subcommand
+        Generate a JSON file for the Windows executable '{exec_name}' to list all available flags or subcommands and their aliases with the following structure:
         
         Return ONLY the JSON object, no additional text.
 
@@ -188,7 +174,7 @@ def generate_json_with_model(exec_name, exec_list):
 
         req_body = {
             "prompt": prompt,
-            "max_tokens": 2048
+            "max_tokens": 5000
         }
         response = requests.post(url=LLM_API_ENDPOINT, json=req_body)
         
@@ -202,7 +188,7 @@ def generate_json_with_model(exec_name, exec_list):
             response_text = response_text[:-3]
         
         original_data = json.loads(response_text)
-        data = original_data.get("response", {})
+        data =json.loads( original_data.get("response", {}))
         argument_dict = dict()
         switch_dict = dict()
         cmd_dict = dict()
@@ -239,7 +225,7 @@ def generate_json_with_model(exec_name, exec_list):
 
 def get_potential_bypass_cmd_with_model(rule_filename, captured_commands=None):
     script_dir = Path(__file__).parent
-    rule_dir = script_dir / "windows_process_creation"
+    rule_dir = script_dir / "windows_process_creation/windows_process_creation"
     with open(rule_dir / f"{rule_filename}.yml", "r") as f:
         data = yaml.safe_load(f)
     detection_data = data.get('detection', '')
@@ -262,22 +248,18 @@ You are an expert in Windows command evasion and Sigma rule bypasses.
 2. Use different techniques to avoid detection:
 - Alternative command syntax or flags
 - Obfuscation techniques (case randomization, escaped characters)
-- Different tool alternatives that perform the same action
 - Indirect execution paths
 3. Do NOT simply add comments or quotes
-4. Return ONLY the command string, no explanation
+4. Do NOT try to use an alternative executable
+5. Return ONLY the command string, no explanation
 
 Return ONLY the command, nothing else.
 """
-
-    if not GEMINI_AVAILABLE:
-        print(f"[!] Gemini API not available")
-        return None
     
     try:
         request_data = {
             "prompt": prompt,
-            "max_tokens": 8192
+            "max_tokens": 16334
         }
         raw_response = requests.post(url=LLM_API_ENDPOINT, json=request_data)
         if raw_response:

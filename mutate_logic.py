@@ -38,19 +38,19 @@ def obfuscate_flag(flag):
     if not flag:
         return flag
     # Handle flags starting with - or /
-    if flag[0] in ['-', '/']:
+    prefix = flag[0] if flag[0] in ['-', '/'] else ''
+    rand = random.randint(0, 1)
+    if rand == 0:
         if flag[0] == '-':
-            prefix = "/"
-        elif flag[1] == '/':
+            prefix = '/'
+        elif flag[0] == '/':
             prefix = '-'
-        rest = flag[1:]
 
-        if rest[0] != "\"":
-            return f'{prefix}"{rest}"'
+    rest = flag[1:]
+    if rest[0] != "\"":
+        return f'{prefix}"{rest}"'
         #do not wrap tons of quotes
-        return f'{prefix}{rest}'
-    
-    return flag
+    return f'{prefix}{rest}'
 
 def replace_with_spacing_modifier(char):
     """
