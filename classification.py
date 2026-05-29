@@ -2,16 +2,17 @@ import argparse
 import shlex
 import re
 
-PLACEHOLDER_RE = re.compile(r'#?\{([A-Za-z0-9_.:-]+)\}')
-ENV_VAR_RE = re.compile(r'^%.+%$')
-PS_VAR_RE = re.compile(r'^\$[a-zA-Z0-9_:]+$')
-FLAG_RE = re.compile(r'^\^?[/-].+')
-OPERATOR_RE = re.compile(r'^[&|><!]+$')
-URL_RE = re.compile(r'^[a-zA-Z0-9-]{2,20}://')
-IP_RE = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
-PATH_RE = re.compile(r'.*[\\]+.*')
-EXT_RE = re.compile(r'\.([a-zA-Z0-9]{2,5})$')
-CMDLET_RE = re.compile(r'^[a-zA-Z]+-[a-zA-Z]+$')
+
+
+ENV_VAR_RE = re.compile(r'^%.+%$') #env variable in PS
+PS_VAR_RE = re.compile(r'^\$[a-zA-Z0-9_:]+$') #variable in PS
+FLAG_RE = re.compile(r'^\^?[/-].+') #flag in cmd or PS, e.g -p, /c, export(subcommand flags)
+OPERATOR_RE = re.compile(r'^[&|><!]+$') #operators in cmd or PS, e.g &, |, >, <, !, &&, ||, etc.
+URL_RE = re.compile(r'^[a-zA-Z0-9-]{2,20}://') #URL: http://example.com, ftp://example.com, etc.
+IP_RE = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') # IP address: 127.0.0.1
+PATH_RE = re.compile(r'.*[\\]+.*') # path with backslashes, e.g C:\Tools\ncat.exe, \\server\share\file.txt, etc.
+EXT_RE = re.compile(r'\.([a-zA-Z0-9]{2,5})$') # file extension: .exe, .bat, .ps1, .cmd, .vbs, etc.
+CMDLET_RE = re.compile(r'^[a-zA-Z]+-[a-zA-Z]+$') # PS cmdlet: e.g Invoke-WebRequest, Get-Process, etc.
 
 CMD_RE = re.compile(
     r'^(?:'
@@ -76,9 +77,6 @@ def try_parse_with_argparse(executable, command, dict_list):
 def classify_token(token):
     token = token.strip().strip('"\'')
     if not token: return None, None
-    
-
-    if PLACEHOLDER_RE.search(token): return 'placeholder'
 
     if CMD_RE.match(token): return 'cmd'
 
