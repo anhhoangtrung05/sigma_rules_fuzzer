@@ -1,14 +1,23 @@
-from pathlib import Path
+import re
 
-# The exact path from your error message
-target_path = Path(r"C:\Users\bkcs\purple_fuzz_mutator_dev\sigma_rules_fuzzer\windows_process_creation")
+powershell_logs = [
+    r"Copy-Item ('C:\Windows\NTDS\nt' + 'ds.dit') -Destination 'C:\exfil\data.bin'",
+    r"New-Item -ItemType SymbolicLink -Path C:\temp\vss_link -Target \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1",
+    r"Invoke-WmiMethod -Class ('Win32_Shad' + 'owCopy') -Name ('Cre' + 'ate') -ArgumentList 'C:\'",
+    r"Get-Process | Where-Object { $_.Modules.ModuleName -contains 'rdpcorets.dll' }",
+    r"Get-Item -Path 'HKCU:\Software' | Export-Clixml -Path 'C:\temp\export.xml'",
+    r"Set-Clipboard -Value 'Write-Host test'; Invoke-Expression (Get-Clipboard)"
+]
 
-print(f"[*] Does the directory exist? {target_path.exists()}")
+pattern = r"(?i)\b([a-z]+(?:-[a-z0-9]+)+)\b([^;|]*)"
 
-if target_path.exists():
-    print(f"[*] Here is exactly what Python sees inside this directory:")
-    for file in target_path.iterdir():
-        # Using repr() to expose any hidden spaces or weird characters
-        print(f"    {repr(file.name)}")
-else:
-    print("[!] Python cannot find the folder itself. Check the parent folders for typos.")
+for log in powershell_logs:
+    print(f"\n--- Analyzing Log: {log[:30]}... ---")
+    
+    # finditer allows us to catch multiple cmdlets in a single line
+    matches = re.finditer(pattern, log)
+    
+    for match in matches:
+        cmdlet = match.group(1).strip()
+        args = match.group(2).strip()
+        print(f"Cmdlet: {cmdlet.ljust(20)} | Args: {args}")

@@ -136,45 +136,54 @@ def generate_json_with_model(exec_name, exec_list):
     print("[DEBUG] Generating executable dictionary with model.....")
     try:
         prompt = f"""
-        Generate a JSON file for the Windows executable '{exec_name}' to list all available flags or subcommands and their aliases with the following structure:
-        
-        Return ONLY the JSON object, no additional text.
-
-        Example output:
+        You are an expert Cybersecurity Engineer and Systems Architect specialized in command-line forensics and data modeling. Your task is to analyze Windows/Linux executables, PowerShell cmdlets, or scripts provided by the user, and map their parameters into a strict, standardized JSON format.
+        Generate a JSON file for the Windows executable '{exec_name}' to list all available flags or subcommands and their aliases/short forms.
+        ### REQUIRED JSON SCHEMA:
+1. The root must be a single JSON object.
+2. The first key must ALWAYS be `"_meta"` containing a `"name"` (the binary name without .exe) and `"type"` (e.g., "executable", "powershell_cmdlet", "python_function").
+3. All subsequent keys represent a valid subcommand, switch, or argument.
+4. The value for each key MUST be a two-element array: `["Alias_or_Equivalent", "Type"]`.
+5. Valid "Type" values are strictly limited to:
+   - "Subcommand": A primary action verb (e.g., "use", "create", "list").
+   - "Switch": A boolean flag that takes no value (e.g., "/quiet", "-v").
+   - "Argument": A flag that requires a trailing value (e.g., "-p <PID>", "/USER:<name>").
+6. BIDIRECTIONAL MAPPING IS MANDATORY: If a short-form alias exists for a long-form flag, you must create a key for BOTH, pointing to each other. (If a flag has no alias, map it to "-" or itself).
+        ### FEW-SHOT EXAMPLES: For wevtutil.exe:
         {{
     "_meta": {{
-        "executable": "esentutl.exe",
-        "category": "Credential_Access_and_LOLBAS",
-        "description": "Extensible Storage Engine Utilities. Frequently abused by threat actors to copy locked system files (like ntds.dit or SAM hives) using Volume Shadow Copies."
+        "name": "wevtutil",
+        "type": "executable"
     }},
-    "/y": ["-y", "Argument"],
-    "-y": ["/y", "Argument"],
-    "/d": ["-d", "Argument"],
-    "-d": ["/d", "Argument"],
-    "/vss": ["-vss", "Switch"],
-    "-vss": ["/vss", "Switch"],
-    "/vssrec": ["-vssrec", "Switch"],
-    "-vssrec": ["/vssrec", "Switch"],
-    "/r": ["-r", "Argument"],
-    "-r": ["/r", "Argument"],
-    "/p": ["-p", "Argument"],
-    "-p": ["/p", "Argument"],
-    "/m": ["-m", "Argument"],
-    "-m": ["/m", "Argument"],
-    "/g": ["-g", "Argument"],
-    "-g": ["/g", "Argument"],
-    "/c": ["-c", "Argument"],
-    "-c": ["/c", "Argument"],
-    "/o": ["-o", "Switch"],
-    "-o": ["/o", "Switch"],
-    "/8": ["-8", "Argument"],
-    "-8": ["/8", "Argument"]
+    "clear-log": ["cl", "Subcommand"],
+    "cl": ["clear-log", "Subcommand"],
+    "query-events": ["qe", "Subcommand"],
+    "qe": ["query-events", "Subcommand"],
+    "enum-logs": ["el", "Subcommand"],
+    "el": ["enum-logs", "Subcommand"],
+    "get-log": ["gl", "Subcommand"],
+    "gl": ["get-log", "Subcommand"],
+    "get-publisher": ["gp", "Subcommand"],
+    "gp": ["get-publisher", "Subcommand"],
+    "/backup": ["/bu", "Argument"],
+    "/bu": ["/backup", "Argument"],
+    "/format": ["/f", "Argument"],
+    "/f": ["/format", "Argument"],
+    "/remote": ["/r", "Argument"],
+    "/r": ["/remote", "Argument"],
+    "/overwrite": ["/o", "Argument"],
+    "/o": ["/overwrite", "Argument"],
+    "/config": ["/c", "Argument"],
+    "/c": ["/config", "Argument"],
+    "/query": ["/q", "Argument"],
+    "/q": ["/query", "Argument"]
 }}
+        Return ONLY the JSON object, no additional text.
+        
         """
 
         req_body = {
             "prompt": prompt,
-            "max_tokens": 5000
+            "max_tokens": 5500
         }
         response = requests.post(url=LLM_API_ENDPOINT, json=req_body)
         

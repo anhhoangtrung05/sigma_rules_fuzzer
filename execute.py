@@ -27,12 +27,7 @@ class ExecuteAgent:
     def execute_command(self, command: str) -> Dict:
         """
         Execute a single command and log output.
-        
-        Args:
-            command: The command to execute
-            
-        Returns:
-            Dict with command, return_code, stdout, stderr
+        Strictly enforces timeout and kills the entire process tree if it hangs.
         """
         result = {
             'command': command,
@@ -44,28 +39,36 @@ class ExecuteAgent:
         try:
             logger.info(f"Executing: {command}")
             
-            process = subprocess.run(
+            process = subprocess.Popen(
                 command,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout
+                shell=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
             )
-            result['return_code'] = process.returncode
-            result['stdout'] = process.stdout
-            result['stderr'] = process.stderr
+            stdout, stderr = process.communicate(input="Y\n", timeout=self.timeout)
             
-            #if process.stdout:
-                #logger.info(f"STDOUT:\n{process.stdout}")
-            #if process.stderr:
-                #logger.warning(f"STDERR:\n{process.stderr}")
+            result['return_code'] = process.returncode
+            result['stdout'] = stdout
+            result['stderr'] = stderr
             
             logger.info(f"Return code: {process.returncode}\n")
                 
         except subprocess.TimeoutExpired:
-            logger.error(f"Command timed out after {self.timeout}s\n")
+            logger.error(f"Command timed out after {self.timeout}s. Terminating process tree...\n")
+            kill_cmd = f"taskkill /F /T /PID {process.pid}"
+            subprocess.run(kill_cmd, shell=True, capture_output=True)
+            process.kill()
+            process.communicate()
+            
+            result['return_code'] = -1
+            result['stderr'] = f"KILLED AFTER TIMEOUT: {self.timeout}s"
             
         except Exception as e:
             logger.error(f"Execution error: {e}\n")
+            result['return_code'] = -1
+            result['stderr'] = str(e)
         
         return result
     

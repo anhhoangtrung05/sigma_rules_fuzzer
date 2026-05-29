@@ -86,7 +86,7 @@ def classify_token(token):
         return 'executable_name'
 
     if PS_VAR_RE.match(token): return 'ps_var'
-    if CMDLET_RE.match(token): return 'executable_name'
+    if CMDLET_RE.match(token): return 'cmdlet'
 
 
     if ENV_VAR_RE.match(token): return 'env'

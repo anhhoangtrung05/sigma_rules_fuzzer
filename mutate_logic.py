@@ -12,7 +12,6 @@ def randomize_case(token, token_type):
     """
     Randomize the case of a token
     """
-    #mutate url scheme
     if token_type == 'url':
         pos = token.find("://")
         mutated_part = token[:pos]
@@ -60,9 +59,9 @@ def replace_with_spacing_modifier(char):
     return char_mapping.get(char, char)
 
 
-def obfuscate_subcommand(flag):
+def obfuscate_string(flag):
     """
-    Obfuscate a subcommand token by randomly joining with carets (^) or wrapping random characters with quotes
+    Obfuscate a subcommand token/a string by randomly joining with carets (^) or wrapping random characters with quotes
     """
     forbidden_next_chars = ['n', 'r', 't', 'a', 'b', 'f', 'v', '0', '"', "'", '$']
 
