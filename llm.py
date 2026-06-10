@@ -268,7 +268,7 @@ Return ONLY the command, nothing else.
     try:
         request_data = {
             "prompt": prompt,
-            "max_tokens": 16334
+            "max_tokens": 67000
         }
         raw_response = requests.post(url=LLM_API_ENDPOINT, json=request_data)
         if raw_response:

@@ -1,12 +1,11 @@
 import subprocess
 import os
 from typing import List, Dict
+import datetime
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-
 class ExecuteAgent:
     """
     Execute a batch of commands from output files.
@@ -27,7 +26,12 @@ class ExecuteAgent:
     def execute_command(self, command: str) -> Dict:
         """
         Execute a single command and log output.
-        Strictly enforces timeout and kills the entire process tree if it hangs.
+        
+        Args:
+            command: The command to execute
+            
+        Returns:
+            Dict with command, return_code, stdout, stderr
         """
         result = {
             'command': command,
@@ -37,38 +41,37 @@ class ExecuteAgent:
         }
         
         try:
+            start_time = datetime.datetime.utcnow()
             logger.info(f"Executing: {command}")
             
             process = subprocess.Popen(
                 command,
                 shell=True,
-                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True
             )
-            stdout, stderr = process.communicate(input="Y\n", timeout=self.timeout)
             
-            result['return_code'] = process.returncode
-            result['stdout'] = stdout
-            result['stderr'] = stderr
-            
-            logger.info(f"Return code: {process.returncode}\n")
+            try:
+                stdout, stderr = process.communicate(timeout=self.timeout)
+                result['return_code'] = process.returncode
+                result['stdout'] = stdout
+                result['stderr'] = stderr
+                result['start_time'] = start_time
                 
-        except subprocess.TimeoutExpired:
-            logger.error(f"Command timed out after {self.timeout}s. Terminating process tree...\n")
-            kill_cmd = f"taskkill /F /T /PID {process.pid}"
-            subprocess.run(kill_cmd, shell=True, capture_output=True)
-            process.kill()
-            process.communicate()
-            
-            result['return_code'] = -1
-            result['stderr'] = f"KILLED AFTER TIMEOUT: {self.timeout}s"
+                #if stdout:
+                    #logger.info(f"STDOUT:\n{stdout}")
+                #if stderr:
+                    #logger.warning(f"STDERR:\n{stderr}")
+                
+                logger.info(f"Return code: {process.returncode}\n")
+                
+            except subprocess.TimeoutExpired:
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], capture_output=True)
+                logger.error(f"Command timed out after {self.timeout}s\n")
             
         except Exception as e:
             logger.error(f"Execution error: {e}\n")
-            result['return_code'] = -1
-            result['stderr'] = str(e)
         
         return result
     

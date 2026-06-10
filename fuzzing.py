@@ -17,6 +17,9 @@ from zircolite import ZircoliteAgent
 from llm import generate_json_with_model, get_potential_bypass_cmd_with_model
 import time
 import sys
+import datetime
+import subprocess
+import xml.etree.ElementTree as ET
 
 # --- 1. CONFIGURATION & REGEX ---
 SEEDS_DIR = "seeds"  
@@ -32,6 +35,17 @@ exec_list = list()
 seed_queue = Queue()
 execute_queue = Queue()
 rule_filename_to_title = {}  # Global dictionary to map filenames to rule titles
+all_extracted_record_ids = set()
+queried_commands = set()
+tree_mapping = {}
+
+# Global Stats
+stats_total_executed = 0
+stats_total_failed = 0
+stats_bypass_target_only = 0
+stats_bypass_all = 0
+stats_captured_by_target = 0
+rule_states = {} # rule_title -> state ('CAPTURED', 'BYPASS_ONE', 'BYPASS_ALL')
 
 #LOGIC FUNCTIONS
 def get_exec_list():
@@ -42,6 +56,191 @@ def get_exec_list():
         return exec_list
     except:
         return
+
+def get_latest_sysmon_record_id():
+    script = """
+    $ErrorActionPreference = 'Stop'
+    try {
+      $event = Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' -MaxEvents 1 -ErrorAction Stop
+      if ($null -eq $event) { '0' } else { [string]$event.RecordId }
+    } catch {
+      Write-Error $_.Exception.Message
+      exit 1
+    }
+    """
+    import base64
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded]
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors='ignore')
+    if proc.returncode == 0:
+        text = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+        try:
+            return int(text)
+        except ValueError:
+            return 0
+    return 0
+
+def find_relevant_logs(pending_commands, start_record_id):
+    global all_extracted_record_ids, queried_commands, tree_mapping
+    valid_cmds = [c for c in pending_commands if c['command'] not in queried_commands]
+
+    if not valid_cmds:
+        return
+        
+    for c in valid_cmds:
+        queried_commands.add(c['command'])
+
+    query = f"*[System[(EventID=1) and (EventRecordID>{start_record_id})]]"
+    wevtutil_cmd = ['wevtutil', 'qe', 'Microsoft-Windows-Sysmon/Operational', f'/q:{query}', '/e:Events']
+
+    
+    try:
+        proc = subprocess.run(wevtutil_cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+        xml_output = proc.stdout
+
+    except Exception as e:
+        print(f"[!] Error running wevtutil qe: {e}")
+        return
+        
+    if not xml_output or not xml_output.strip():
+        return
+
+        
+    try:
+        root = ET.fromstring(xml_output)
+    except Exception as e:
+        print(f"[!] XML parsing error: {e}")
+        return
+
+    ns = {'ns': 'http://schemas.microsoft.com/win/2004/08/events/event'}
+    command_strings = [c['command'] for c in valid_cmds]
+    
+    # 1. Phase 1: Parse all events into a simpler dictionary list
+    parsed_events = []
+    for event in root.findall('ns:Event', ns):
+        system_node = event.find('ns:System', ns)
+        if system_node is None: continue
+        
+        event_record_id_node = system_node.find('ns:EventRecordID', ns)
+        if event_record_id_node is None: continue
+        record_id = event_record_id_node.text
+        
+        event_data_node = event.find('ns:EventData', ns)
+        if event_data_node is None: continue
+            
+        cmdline = ""
+        parent_cmdline = ""
+        process_guid = ""
+        parent_process_guid = ""
+        for data in event_data_node.findall('ns:Data', ns):
+            name = data.get('Name')
+            text = data.text or ""
+            if name == 'CommandLine': cmdline = text
+            elif name == 'ParentCommandLine': parent_cmdline = text
+            elif name == 'ProcessGuid': process_guid = text
+            elif name == 'ParentProcessGuid': parent_process_guid = text
+            
+        parsed_events.append({
+            'record_id': record_id,
+            'cmdline': cmdline,
+            'parent_cmdline': parent_cmdline,
+            'process_guid': process_guid,
+            'parent_process_guid': parent_process_guid
+        })
+
+    # 2. Phase 2: Identify Root Events and populate tree_mapping
+    known_guids = {} # maps ProcessGuid -> root_command
+    for ev in parsed_events:
+        cmdline_norm = " ".join(ev['cmdline'].lower().split())
+        parent_norm = " ".join(ev['parent_cmdline'].lower().split())
+        
+        for cmd in command_strings:
+            cmd_norm = " ".join(cmd.lower().split())
+            if cmd_norm in cmdline_norm or cmd_norm in parent_norm:
+                if ev['process_guid']:
+                    known_guids[ev['process_guid']] = cmd
+                all_extracted_record_ids.add(ev['record_id'])
+                tree_mapping[ev['record_id']] = cmd
+                break
+                
+    # 3. Phase 3: Loop to collect Child Events and inherit root commands
+    changed = True
+    while changed:
+        changed = False
+        for ev in parsed_events:
+            if ev['process_guid'] and ev['process_guid'] not in known_guids:
+                if ev['parent_process_guid'] in known_guids:
+                    # It's a child! Inherit from parent
+                    root_cmd = known_guids[ev['parent_process_guid']]
+                    known_guids[ev['process_guid']] = root_cmd
+                    all_extracted_record_ids.add(ev['record_id'])
+                    tree_mapping[ev['record_id']] = root_cmd
+                    changed = True
+
+def export_all_logs():
+    global all_extracted_record_ids
+    if not all_extracted_record_ids:
+        print("[-] No relevant logs to export to sigma_execution.evtx.")
+        return False
+        
+    print(f"[*] Exporting {len(all_extracted_record_ids)} Sysmon events to sigma_execution.evtx...")
+    sq_xml = '<QueryList><Query Id="0" Path="Microsoft-Windows-Sysmon/Operational">'
+    record_ids_list = list(all_extracted_record_ids)
+    # Use individual <Select> nodes for each EventRecordID to avoid XPath complexity limits (wevtutil error 15001)
+    for rid in record_ids_list:
+        select_node = f'<Select Path="Microsoft-Windows-Sysmon/Operational">*[System[(EventRecordID={rid})]]</Select>'
+        sq_xml += select_node
+    sq_xml += '</Query></QueryList>'
+    
+    temp_sq_file = "sigma_execution_query.xml"
+    try:
+        with open(temp_sq_file, "w", encoding='utf-8') as f:
+            f.write(sq_xml)
+            
+        subprocess.run(['wevtutil', 'epl', temp_sq_file, 'sigma_execution.evtx', '/sq:true', '/ow:true'], check=True)
+        print("[+] Successfully exported sigma_execution.evtx")
+        return True
+    except Exception as e:
+        print(f"[!] Error exporting events: {e}")
+        return False
+
+def write_overall_stats():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir_path = os.path.join(script_dir, OUT_DIR)
+    
+    if not os.path.exists(out_dir_path):
+        os.makedirs(out_dir_path)
+        
+    overall_path = os.path.join(out_dir_path, "Overall.csv")
+    print(f"\n[*] Writing Overall.csv statistics to {overall_path}...")
+    try:
+        with open(overall_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Metric", "Count"])
+            writer.writerow(["Total Executed Commands", stats_total_executed])
+            writer.writerow(["Total Failed Commands", stats_total_failed])
+            writer.writerow(["Commands Bypassed Target Only", stats_bypass_target_only])
+            writer.writerow(["Commands Bypassed All Rules", stats_bypass_all])
+            writer.writerow(["Commands Captured by Target", stats_captured_by_target])
+            writer.writerow([])
+            writer.writerow(["Rule Title", "State"])
+            for rule_title, state in rule_states.items():
+                writer.writerow([rule_title, state])
+        print("[+] Successfully wrote Overall.csv")
+    except Exception as e:
+        print(f"[!] Error writing Overall.csv: {e}")
+
+    result_path = os.path.join(out_dir_path, "result.csv")
+    print(f"\n[*] Writing result.csv statistics to {result_path}...")
+    try:
+        with open(result_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Rule Title", "State"])
+            for rule_title, state in rule_states.items():
+                writer.writerow([rule_title, state])
+        print("[+] Successfully wrote result.csv")
+    except Exception as e:
+        print(f"[!] Error writing result.csv: {e}")
 
 def countdown_sleep(seconds, label="Waiting"):
     """
@@ -300,21 +499,35 @@ def execute(shell='powershell', timeout=10):
 
     all_result = list()
 
+    global stats_total_executed, stats_total_failed
     curr_batch_length = execute_queue.qsize()
+    
+    expected_return_code = None
+    
     for i in range(curr_batch_length):
         command_obj = execute_queue.get()
         if isinstance(command_obj, dict):
             command = command_obj.get('command', '')
             rule_title = command_obj.get('rule_title', 'unknown')
+            is_original = command_obj.get('is_original', False)
         else:
             command = command_obj
             rule_title = 'unknown'
+            is_original = False
         
+        stats_total_executed += 1
         result = agent.execute_command(command)
+        
+        if is_original:
+            expected_return_code = result.get('return_code') if isinstance(result, dict) else getattr(result, 'return_code', None)
         
         # Check for syntax errors in stderr
         has_syntax_error = False
         if result:
+            actual_return_code = result.get('return_code') if isinstance(result, dict) else getattr(result, 'return_code', None)
+            if actual_return_code != expected_return_code:
+                has_syntax_error = True
+                
             stderr_content = None
             stdout_content = None
             if isinstance(result, dict) and 'stderr' in result:
@@ -332,7 +545,13 @@ def execute(shell='powershell', timeout=10):
                     'invalid syntax',
                     'parse error',
                     'could not be loaded',
-                    'Access is denied',
+                    'access is denied',
+                    'invalid argument',
+                    'invalid flag', 'invalid',
+                    'invalid option',
+                    'alias not found',
+                    '/?','-?','-h','--help','/h','not a valid',
+                    'syntax is incorrect', 'incorrect'
                 ]
 
             if stderr_content:
@@ -347,9 +566,11 @@ def execute(shell='powershell', timeout=10):
         
         # Only push back and collect result if no syntax error
         if not has_syntax_error:
-            execute_queue.put({'command': command, 'rule_title': rule_title})
+            start_time = result.get('start_time') if isinstance(result, dict) else getattr(result, 'start_time', None)
+            execute_queue.put({'command': command, 'rule_title': rule_title, 'start_time': start_time})
             all_result.append(result)
         else:
+            stats_total_failed += 1
             print(f"Removed commands: {command} (Rule: {rule_title})")
     
     return all_result
@@ -357,7 +578,7 @@ def execute(shell='powershell', timeout=10):
 
 def zircolite_check(
     rules_dir='./windows_process_creation',
-    events_file='C:\Windows\System32\winevt\Logs\Microsoft-Windows-Sysmon%4Operational.evtx',
+    events_file='sigma_execution.evtx',
     zircolite_path='../Zircolite/zircolite.py',
     output_dir='./zircolite_output'
 ):
@@ -389,14 +610,20 @@ def zircolite_check(
     return summary
 
 #fuzzing loop: get seed from queue -> mutate -> execute batch -> zircolite check (every 20 seeds) -> select successful bypass seed
-ZIRCOLITE_CHECK_INTERVAL = 20  # Run Zircolite once every N seeds
+ZIRCOLITE_CHECK_INTERVAL = 100  # Run Zircolite once every N seeds
 def fuzzing_loop():
     seeds_processed = 0 
     pending_commands = []
     llm_call_counts = {} 
+    
+    print("[*] Fetching initial Sysmon Record ID...")
+    current_start_record_id = get_latest_sysmon_record_id()
+    print(f"[*] Starting from Record ID: {current_start_record_id}")
+    
     try:
         while True:
             if seed_queue.qsize() == 0:
+
                 raise KeyboardInterrupt
             try:
                 curr_seed_obj = seed_queue.get()
@@ -410,27 +637,41 @@ def fuzzing_loop():
                     rule_filename = 'unknown'
                     rule_title = 'unknown'
 
-                mutated_command = fuzzing(curr_seed_obj)
+                mutated_command = [curr_seed_obj.get('command','')]#fuzzing(curr_seed_obj)
                 for command in mutated_command:
-                    execute_queue.put({'command': command, 'rule_title': rule_title})
+                    execute_queue.put({
+                        'command': command, 
+                        'rule_title': rule_title,
+                        'is_original': command == curr_seed
+                    })
                 execute()
                 seeds_processed += 1
 
+                commands_added = 0
                 # Drain execute_queue into pending_commands
                 while not execute_queue.empty():
                     cmd_obj = execute_queue.get()
+                    commands_added += 1
                     if isinstance(cmd_obj, dict):
                         pending_commands.append({
                             'command':       cmd_obj.get('command', ''),
                             'rule_title':    cmd_obj.get('rule_title', 'unknown'),
                             'rule_filename': rule_filename,
+                            'start_time':    cmd_obj.get('start_time', None)
                         })
                     else:
                         pending_commands.append({
                             'command':       cmd_obj,
                             'rule_title':    'unknown',
                             'rule_filename': rule_filename,
+                            'start_time':    None
                         })
+                
+                if commands_added == 0:
+                    print(f"[!] No valid commands executed for seed: {curr_seed}. Writing to not_executed.csv")
+                    with open(os.path.join(script_dir, OUT_DIR, "not_executed.csv"), "a", encoding="utf-8", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([rule_filename, curr_seed])
 
                 # Only run Zircolite every ZIRCOLITE_CHECK_INTERVAL seeds
                 if seeds_processed % ZIRCOLITE_CHECK_INTERVAL != 0:
@@ -442,26 +683,49 @@ def fuzzing_loop():
                 print(f"[*] Reached {seeds_processed} seeds — running Zircolite check "
                       f"on {len(pending_commands)} accumulated commands...")
                 #Waiting for Sysmon to logs all events....
-                countdown_sleep(90, "Waiting for Sysmon to log all events")
+                countdown_sleep(30, "Waiting for Sysmon to log all events")
+                find_relevant_logs(pending_commands, current_start_record_id)
+                
+                if export_all_logs():
+                    zircolite_check()
+                else:
+                    print("[!] No logs exported, skipping Zircolite check for this batch.")
+                    # Ensure stale detections are not reused
+                    if os.path.exists(os.path.join(script_dir, ZIRCOLITE_DETECTED_EVENTS)):
+                        try:
+                            os.remove(os.path.join(script_dir, ZIRCOLITE_DETECTED_EVENTS))
+                        except Exception:
+                            pass
 
-                zircolite_check()
+                # Reset start_record_id, clear mapped events, and empty pending commands for the next batch
+                current_start_record_id = get_latest_sysmon_record_id()
+                all_extracted_record_ids.clear()
+                tree_mapping.clear()
+                
+                print(f"[*] Resetting start Record ID for next batch: {current_start_record_id}")
+
 
                 # Build a mapping of commands to the alert rules that detected them.
                 command_rule_map = {}  # {command: [{title, id}, ...]}
 
-                with open(os.path.join(script_dir, ZIRCOLITE_DETECTED_EVENTS), "r", encoding='utf-8', errors='replace') as f:
-                    rules_triggered = json.load(f)
+                try:
+                    with open(os.path.join(script_dir, ZIRCOLITE_DETECTED_EVENTS), "r", encoding='utf-8', errors='replace') as f:
+                        rules_triggered = json.load(f)
+                except FileNotFoundError:
+                    rules_triggered = []
 
                 for rule in rules_triggered:
                     rule_title_iter = rule.get("title", "unknown")
                     rule_id    = rule.get("id", "unknown")
                     matches    = rule.get("matches", [])
                     for match in matches:
-                        for field in ("CommandLine", "ParentCommandLine"):
-                            cmdline = match.get(field)
-                            if not cmdline:
-                                continue
-                            entry = command_rule_map.setdefault(cmdline, [])
+                        record_id = str(match.get("EventRecordID", ""))
+                        if not record_id:
+                            record_id = str(match.get("System.EventRecordID", ""))
+                            
+                        if record_id and record_id in tree_mapping:
+                            root_cmd = tree_mapping[record_id]
+                            entry = command_rule_map.setdefault(root_cmd, [])
                             if not any(e['id'] == rule_id for e in entry):
                                 entry.append({'title': rule_title_iter, 'id': rule_id})
                 
@@ -483,25 +747,43 @@ def fuzzing_loop():
                     cmd_rule_title    = cmd_obj['rule_title']
                     cmd_rule_filename = cmd_obj['rule_filename']
 
-                    # Collect all alert entries that matched this command
-                    matched_entries = []
-
-                    # Direct match
+                    # Find all rules this command triggered
+                    all_triggered_rules = []
+                    
                     if curr_command in command_rule_map:
-                        if cmd_rule_title in [e['title'] for e in command_rule_map[curr_command]]:
-                            matched_entries = command_rule_map[curr_command]
-                            print(f"[LOG] Captured command {curr_command} by rule '{cmd_rule_title}'")
-
-                    # Substring match (command is contained within a longer logged commandline)
-                    if not matched_entries:
-                        for logged_cmd, alert_entries in command_rule_map.items():
-                            titles = [e['title'] for e in alert_entries]
-                            if cmd_rule_title in titles and curr_command in logged_cmd:
-                                matched_entries = alert_entries
-                                print(f"[LOG] Captured command {curr_command} in command-line {logged_cmd} (Rule: {cmd_rule_title})")
-                                break
-
-                    captured = bool(matched_entries)
+                        all_triggered_rules.extend(command_rule_map[curr_command])
+                    
+                    triggered_any = len(all_triggered_rules) > 0
+                    triggered_target = any(e['title'] == cmd_rule_title for e in all_triggered_rules)
+                    
+                    global stats_bypass_all, stats_bypass_target_only, stats_captured_by_target
+                    
+                    cmd_state = ""
+                    if not triggered_any:
+                        cmd_state = "BYPASS_ALL"
+                        stats_bypass_all += 1
+                    elif triggered_any and not triggered_target:
+                        cmd_state = "BYPASS_ONE"
+                        stats_bypass_target_only += 1
+                    else:
+                        cmd_state = "CAPTURED"
+                        stats_captured_by_target += 1
+                        
+                    # Update rule state map
+                    # State Priority: BYPASS_ALL > BYPASS_ONE > CAPTURED
+                    current_rule_state = rule_states.get(cmd_rule_title, "CAPTURED")
+                    if cmd_state == "BYPASS_ALL":
+                        rule_states[cmd_rule_title] = "BYPASS_ALL"
+                    elif cmd_state == "BYPASS_ONE" and current_rule_state != "BYPASS_ALL":
+                        rule_states[cmd_rule_title] = "BYPASS_ONE"
+                    elif cmd_state == "CAPTURED" and current_rule_state not in ["BYPASS_ALL", "BYPASS_ONE"]:
+                        rule_states[cmd_rule_title] = "CAPTURED"
+                        
+                    captured = triggered_target
+                    matched_entries = [e for e in all_triggered_rules if e['title'] == cmd_rule_title]
+                    
+                    if captured:
+                        print(f"[LOG] Captured command {curr_command} (Rule: {cmd_rule_title})")
 
                     if captured:
                         captured_by_rule.setdefault(cmd_rule_filename, []).append(curr_command)
@@ -552,8 +834,8 @@ def fuzzing_loop():
                 # ----------------------------------------------------------------
                 # Write CSV logs
                 # ----------------------------------------------------------------
-                bypass_csv_path   = os.path.join(script_dir, 'commandlines_pass_bypass.csv')
-                captured_csv_path = os.path.join(script_dir, 'commandlines_captured.csv')
+                bypass_csv_path   = os.path.join(out_dir_path, 'commandlines_pass_bypass.csv')
+                captured_csv_path = os.path.join(out_dir_path, 'commandlines_captured.csv')
 
                 bypass_fields   = ['rule_filename', 'rule_name', 'commandline']
                 captured_fields = ['rule_filename', 'rule_name', 'commandline', 'alert_rules', 'matched_rule_id']
@@ -578,24 +860,24 @@ def fuzzing_loop():
                 # ----------------------------------------------------------------
                 # Ask LLM only for rules where NO bypass was found (all captured)
                 # ----------------------------------------------------------------
-                all_seen_rules = set(bypassed_by_rule) | set(captured_by_rule)
-                for r_filename in all_seen_rules:
-                    if r_filename not in bypassed_by_rule:
+                #all_seen_rules = set(bypassed_by_rule) | set(captured_by_rule)
+                #for r_filename in all_seen_rules:
+                    #if r_filename not in bypassed_by_rule:
                         # Fetch the current call count for this specific rule
-                        current_llm_count = llm_call_counts.get(r_filename, 0)
+                        #current_llm_count = llm_call_counts.get(r_filename, 0)
                         
-                        if current_llm_count < 5:
-                            captured_cmds = captured_by_rule.get(r_filename, [])
-                            print(f"[*] No bypass found for '{r_filename}' — asking LLM for new candidates... (Attempt {current_llm_count + 1}/5)")
-                            new_command = get_potential_bypass_cmd_with_model(r_filename, captured_cmds)
-                            seed_queue.put({"command": new_command, "rule_filename": r_filename})
+                        #if current_llm_count < 5:
+                            #captured_cmds = captured_by_rule.get(r_filename, [])
+                            #print(f"[*] No bypass found for '{r_filename}' — asking LLM for new candidates... (Attempt {current_llm_count + 1}/5)")
+                            #new_command = get_potential_bypass_cmd_with_model(r_filename, captured_cmds)
+                            #seed_queue.put({"command": new_command, "rule_filename": r_filename})
                             
                             # Increment the counter
-                            llm_call_counts[r_filename] = current_llm_count + 1
-                        else:
-                            print(f"[*] Max LLM attempts (5) reached for '{r_filename}'. Skipping LLM call.")
-                    else:
-                        print(f"[*] Bypass found for '{r_filename}' — skipping LLM call.")
+                            #llm_call_counts[r_filename] = current_llm_count + 1
+                        #else:
+                            #print(f"[*] Max LLM attempts (5) reached for '{r_filename}'. Skipping LLM call.")
+                    #else:
+                        #print(f"[*] Bypass found for '{r_filename}' — skipping LLM call.")
             except Exception as inner_e:
                 print(f"[!] Exception during fuzzing iteration. Logging to exception.log and continuing...")
                 try:
@@ -611,9 +893,13 @@ def fuzzing_loop():
 
     except KeyboardInterrupt:
         print("\n[*] Fuzzing loop done. Exiting gracefully...")
+        export_all_logs()
+        write_overall_stats()
     except Exception as e:
         print(f"[!] Critical Error escaping inner fuzzing loop: {e}")
         traceback.print_exc()
+        export_all_logs()
+        write_overall_stats()
 
 def main():
     parser = argparse.ArgumentParser(description="Fuzz command seeds using token-based mutations.")
@@ -642,17 +928,18 @@ def main():
         os.makedirs(out_dir_path)
         print(f"[*] Created output directory '{args.out_dir}'")
 
-    # Look for .json, .txt, and .csv seed files
+    # Look for .json, .txt, .csv, and .tsv seed files
     seed_files_json = [f for f in os.listdir(seeds_dir_path) if f.endswith(".json")]
     seed_files_txt  = [f for f in os.listdir(seeds_dir_path) if f.endswith(".txt")]
     seed_files_csv  = [f for f in os.listdir(seeds_dir_path) if f.endswith(".csv")]
+    seed_files_tsv  = [f for f in os.listdir(seeds_dir_path) if f.endswith(".tsv")]
 
-    if not seed_files_json and not seed_files_txt and not seed_files_csv:
-        print(f"[!] No .json, .txt, or .csv files found in '{SEEDS_DIR}'.")
+    if not seed_files_json and not seed_files_txt and not seed_files_csv and not seed_files_tsv:
+        print(f"[!] No .json, .txt, .csv, or .tsv files found in '{SEEDS_DIR}'.")
         return
 
     print(f"[*] Found {len(seed_files_json)} JSON, {len(seed_files_txt)} TXT, "
-          f"and {len(seed_files_csv)} CSV seed files. Starting batch processing...")
+          f"{len(seed_files_csv)} CSV, and {len(seed_files_tsv)} TSV seed files. Starting batch processing...")
     
     # Process JSON files
     for filename in seed_files_json:
@@ -707,26 +994,27 @@ def main():
             print(f"[!] Error reading TXT file {filename}: {e}")
             continue
 
-    # Process CSV files — expected columns: target_rule, commandline
+    # Process CSV and TSV files — expected columns: target_rule, commandline
     CSV_RULE_COL    = "target_rule"
     CSV_CMD_COL     = "commandline"
 
-    for filename in seed_files_csv:
+    for filename in seed_files_csv + seed_files_tsv:
         input_path = os.path.join(seeds_dir_path, filename)
-        print(f"\n---> Processing CSV: {filename}")
+        is_tsv = filename.lower().endswith(".tsv")
+        print(f"\n---> Processing {'TSV' if is_tsv else 'CSV'}: {filename}")
         added = 0
         try:
             with open(input_path, 'r', encoding='utf-8-sig') as f: 
-                reader = csv.DictReader(f)
+                reader = csv.DictReader(f, delimiter='\t' if is_tsv else ',')
 
                 # Validate that the required columns are present
                 if reader.fieldnames is None:
-                    print(f"[!] CSV file '{filename}' appears to be empty — skipping.")
+                    print(f"[!] {'TSV' if is_tsv else 'CSV'} file '{filename}' appears to be empty — skipping.")
                     continue
 
                 missing = {CSV_RULE_COL, CSV_CMD_COL} - {c.strip() for c in reader.fieldnames}
                 if missing:
-                    print(f"[!] CSV file '{filename}' is missing required column(s): "
+                    print(f"[!] {'TSV' if is_tsv else 'CSV'} file '{filename}' is missing required column(s): "
                           f"{missing}. Found: {reader.fieldnames} — skipping.")
                     continue
 
@@ -746,7 +1034,7 @@ def main():
                         'rule_filename': rule_filename,
                     }
                     seed_queue.put(seed_obj)
-                    print(f"  Added seed: {command} (Rule: {rule_filename})")
+                    #print(f"  Added seed: {command} (Rule: {rule_filename})")
                     added += 1
 
             print(f"[+] {added} seed(s) loaded from '{filename}'.")
@@ -758,6 +1046,8 @@ def main():
     #FUZZING LOOP
     fuzzing_loop()
 
+    export_all_logs()
+    write_overall_stats()
     print(f"\n[*] All done! Check the '{OUT_DIR}' folder.")
 
 
