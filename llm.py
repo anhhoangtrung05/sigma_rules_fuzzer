@@ -284,6 +284,112 @@ Return ONLY the command, nothing else.
         print(f"[!] Error generating bypass command with model: {e}")
         return None
 
+def get_multiple_bypass_cmds_with_model(rule_filename, seed_command, target_count):
+    script_dir = Path(__file__).parent
+    rule_dir = script_dir / "windows_process_creation/windows_process_creation"
+    
+    detection_data = ""
+    try:
+        with open(rule_dir / f"{rule_filename}.yml", "r") as f:
+            data = yaml.safe_load(f)
+        detection_data = data.get('detection', '')
+    except Exception as e:
+        print(f"[!] Warning: Could not load rule {rule_filename}.yml: {e}")
+
+    prompt = f"""
+You are an expert in Windows command evasion and Sigma rule bypasses.
+
+**Sigma Rule Target**: {rule_filename}
+
+**Detection rules**:
+{json.dumps(detection_data, indent=2)}
+
+**Original Seed Command**:
+{seed_command}
+
+**Task**: Generate EXACTLY {target_count} NEW, unique alternative commands that achieve the same functionality as the Original Seed Command but might bypass the '{rule_filename}' detection rule.
+
+**Allowed Mutation Techniques**:
+You are freely allowed to experiment with one or more of these techniques for each command:
+1. Insertion: insert characters such as quotes, spaces, etc.
+2. Substitution: replace a flag with its aliases (like -p and --password), replace literal string with its equivalents (like adduser:yes -> adduser:y), replace a character with its version in another encoding (like 'a' replaced by 'ᵃ', make sure this does not break parsing).
+3. Reordering: swap the positions of flags and subcommands (like procdump -ls -ma changed into procdump -ma -ls).
+4. Omission: omit some flags, arguments in the command that do not change the core behavior of the command (like removing "-v" to exit verbose mode).
+5. Encoding: encode the commands using base64, hex encoding, etc.
+6. Recoding: recode IP addresses (example: 127.0.0.1 into 2130706433, 127.0.0.1 to ::ffff:7f00:1).
+7. Aliasing: Using the same executable, but run it in a different way to achieve the same outcome.
+8. Others: If you use techniques other than the seven listed above, specify them clearly.
+
+**Requirements**:
+1. The commands must be functionally equivalent to the original seed command.
+2. You MUST return a JSON array of objects. Each object must contain the mutated "command" and a list of "techniques" used.
+   Example format:
+   [
+     {{
+       "command": "mutated command 1",
+       "techniques": ["Insertion", "Substitution"]
+     }},
+     {{
+       "command": "mutated command 2",
+       "techniques": ["Others (Custom Encoding)"]
+     }}
+   ]
+
+Return ONLY the JSON array, no explanation or formatting text.
+"""
+    
+    try:
+        request_data = {
+            "prompt": prompt,
+            "max_tokens": 67000
+        }
+        raw_response = requests.post(url=LLM_API_ENDPOINT, json=request_data)
+        if raw_response:
+            json_response = json.loads(raw_response.text)
+            response_text = json_response.get("response", "").strip()
+            
+            # Remove markdown code blocks if present
+            if response_text.startswith('```'):
+                response_text = response_text.split('```')[1]
+                if response_text.startswith('json'):
+                    response_text = response_text[4:]
+            if response_text.endswith('```'):
+                response_text = response_text[:-3]
+                
+            bypass_commands = json.loads(response_text)
+            
+            if isinstance(bypass_commands, list):
+                print(f"[+] Generated {len(bypass_commands)} bypass commands from LLM")
+                
+                extracted_commands = []
+                for item in bypass_commands:
+                    if isinstance(item, dict) and "command" in item:
+                        techniques = item.get("techniques", [])
+                        print(f"    - Command: {item['command']}")
+                        print(f"      Techniques: {', '.join(techniques)}")
+                        
+                        extracted_commands.append({
+                            "command": item["command"],
+                            "technique": techniques if techniques else ["Unknown"]
+                        })
+                    elif isinstance(item, str): # Fallback if model just returns strings
+                        extracted_commands.append({
+                            "command": item,
+                            "technique": ["Unknown"]
+                        })
+                        
+                return extracted_commands
+            else:
+                print(f"[!] LLM did not return a list. Returned type: {type(bypass_commands)}")
+                return []
+        else:
+            print("[DEBUG] Bypass command no where to be found ???")
+            return []
+    
+    except Exception as e:
+        print(f"[!] Error generating bypass commands with model: {e}")
+        return []
+
 def get_potential_bypass_cmd_with_gemini(rule_filename, captured_commands=None):
     
     script_dir = Path(__file__).parent

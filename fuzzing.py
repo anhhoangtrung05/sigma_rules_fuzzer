@@ -14,7 +14,7 @@ from classification import *
 from mutate_logic import *
 from execute import ExecuteAgent
 from zircolite import ZircoliteAgent
-from llm import generate_json_with_model, get_potential_bypass_cmd_with_model
+from llm import generate_json_with_model, get_potential_bypass_cmd_with_model, get_multiple_bypass_cmds_with_model
 import time
 import sys
 import datetime
@@ -611,7 +611,7 @@ def zircolite_check(
 
 #fuzzing loop: get seed from queue -> mutate -> execute batch -> zircolite check (every 20 seeds) -> select successful bypass seed
 ZIRCOLITE_CHECK_INTERVAL = 100  # Run Zircolite once every N seeds
-def fuzzing_loop():
+def fuzzing_loop(mode='basic', target_count=5, max_attempts=50):
     seeds_processed = 0 
     pending_commands = []
     llm_call_counts = {} 
@@ -637,12 +637,24 @@ def fuzzing_loop():
                     rule_filename = 'unknown'
                     rule_title = 'unknown'
 
-                mutated_command = [curr_seed_obj.get('command','')]#fuzzing(curr_seed_obj)
-                for command in mutated_command:
+                if mode == 'llm_only':
+                    print(f"[*] Querying LLM for {target_count} bypass commands for seed...")
+                    mutated_commands = get_multiple_bypass_cmds_with_model(rule_filename, curr_seed, target_count)
+                    if not mutated_commands:
+                        print("[!] LLM failed to generate commands. Falling back to original seed.")
+                        mutated_commands = [{"command": curr_seed, "technique": ["Unknown"]}]
+                else:
+                    raw_commands = fuzzing(curr_seed_obj, target_count=target_count, max_attempts=max_attempts)
+                    mutated_commands = [{"command": c, "technique": ["token_mutation"]} for c in raw_commands]
+                
+                for cmd_dict in mutated_commands:
+                    cmd_str = cmd_dict.get("command", "")
+                    technique = cmd_dict.get("technique", ["Unknown"])
                     execute_queue.put({
-                        'command': command, 
+                        'command': cmd_str, 
                         'rule_title': rule_title,
-                        'is_original': command == curr_seed
+                        'is_original': cmd_str == curr_seed,
+                        'technique': technique
                     })
                 execute()
                 seeds_processed += 1
@@ -657,14 +669,16 @@ def fuzzing_loop():
                             'command':       cmd_obj.get('command', ''),
                             'rule_title':    cmd_obj.get('rule_title', 'unknown'),
                             'rule_filename': rule_filename,
-                            'start_time':    cmd_obj.get('start_time', None)
+                            'start_time':    cmd_obj.get('start_time', None),
+                            'technique':     cmd_obj.get('technique', ['Unknown'])
                         })
                     else:
                         pending_commands.append({
                             'command':       cmd_obj,
                             'rule_title':    'unknown',
                             'rule_filename': rule_filename,
-                            'start_time':    None
+                            'start_time':    None,
+                            'technique':     ['Unknown']
                         })
                 
                 if commands_added == 0:
@@ -740,13 +754,14 @@ def fuzzing_loop():
                 bypassed_by_rule  = {}
                 captured_by_rule  = {}
                 csv_bypass_rows   = []  
-                csv_captured_rows = []  
-
+                csv_bypass_target_rows = []
+                
                 for cmd_obj in pending_commands:
                     curr_command  = cmd_obj['command']
                     cmd_rule_title    = cmd_obj['rule_title']
                     cmd_rule_filename = cmd_obj['rule_filename']
-
+                    cmd_technique     = cmd_obj.get('technique', ['Unknown'])
+                    
                     # Find all rules this command triggered
                     all_triggered_rules = []
                     
@@ -784,65 +799,47 @@ def fuzzing_loop():
                     
                     if captured:
                         print(f"[LOG] Captured command {curr_command} (Rule: {cmd_rule_title})")
-
-                    if captured:
                         captured_by_rule.setdefault(cmd_rule_filename, []).append(curr_command)
-                        alert_titles = ';'.join(e['title'] for e in matched_entries)
-                        alert_ids    = ';'.join(e['id']    for e in matched_entries)
-                        csv_captured_rows.append({
+                    elif cmd_state == "BYPASS_ONE":
+                        bypassed_by_rule.setdefault(cmd_rule_filename, []).append(curr_command)
+                        alert_titles = ';'.join(e['title'] for e in all_triggered_rules)
+                        alert_ids    = ';'.join(e['id']    for e in all_triggered_rules)
+                        csv_bypass_target_rows.append({
                             'rule_filename':  cmd_rule_filename,
                             'rule_name':      cmd_rule_title,
                             'commandline':    curr_command,
+                            'technique':      cmd_technique,
                             'alert_rules':    alert_titles,
                             'matched_rule_id': alert_ids,
                         })
-                    else:
+                    elif cmd_state == "BYPASS_ALL":
                         bypassed_by_rule.setdefault(cmd_rule_filename, []).append(curr_command)
-                        # Not captured by ANY rule in command_rule_map
                         csv_bypass_rows.append({
                             'rule_filename': cmd_rule_filename,
                             'rule_name':     cmd_rule_title,
                             'commandline':   curr_command,
+                            'technique':     cmd_technique
                         })
 
                 # Clear staging list now that all commands have been classified
                 pending_commands.clear()
 
-                # ----------------------------------------------------------------
-                # Write .txt seed files (bypassed commands, grouped by rule)
-                # ----------------------------------------------------------------
-                print("\n[*] Saving seeds for each rule to file...")
-
                 out_dir_path = os.path.join(script_dir, OUT_DIR)
                 if not os.path.exists(out_dir_path):
                     os.makedirs(out_dir_path)
-
-                for r_filename, bypassed_commands in bypassed_by_rule.items():
-                    safe_rule_name = re.sub(r'[<>:"|?*\\/]', '_', r_filename)
-                    output_file = os.path.join(out_dir_path, f"seed_{safe_rule_name}.txt")
-                    try:
-                        with open(output_file, 'a', encoding='utf-8') as f:
-                            for cmd in bypassed_commands:
-                                f.write(f"{cmd}\n")
-                        print(f"[*] Saved {len(bypassed_commands)} bypassed commands for rule '{r_filename}' to {output_file}")
-                    except Exception as e:
-                        print(f"[!] Error saving commands for rule '{r_filename}': {e}")
-
-                if not bypassed_by_rule:
-                    print("[*] No bypassed commands to save across all rules.")
 
                 # ----------------------------------------------------------------
                 # Write CSV logs
                 # ----------------------------------------------------------------
                 bypass_csv_path   = os.path.join(out_dir_path, 'commandlines_pass_bypass.csv')
-                captured_csv_path = os.path.join(out_dir_path, 'commandlines_captured.csv')
+                bypass_target_csv_path = os.path.join(out_dir_path, 'command_bypass_target.csv')
 
-                bypass_fields   = ['rule_filename', 'rule_name', 'commandline']
-                captured_fields = ['rule_filename', 'rule_name', 'commandline', 'alert_rules', 'matched_rule_id']
+                bypass_fields   = ['rule_filename', 'rule_name', 'commandline', 'technique']
+                bypass_target_fields = ['rule_filename', 'rule_name', 'commandline', 'technique', 'alert_rules', 'matched_rule_id']
 
                 for csv_path, fields, rows, label in [
-                    (bypass_csv_path,   bypass_fields,   csv_bypass_rows,   'bypass'),
-                    (captured_csv_path, captured_fields, csv_captured_rows, 'captured'),
+                    (bypass_csv_path,   bypass_fields,   csv_bypass_rows,   'bypass_all'),
+                    (bypass_target_csv_path, bypass_target_fields, csv_bypass_target_rows, 'bypass_target_caught_by_others'),
                 ]:
                     if not rows:
                         continue
@@ -907,6 +904,7 @@ def main():
     parser.add_argument('--out-dir', default=OUT_DIR, help=f"Directory for output files (default: {OUT_DIR})")
     parser.add_argument('--target-count', type=int, default=5, help="Number of mutations per seed (default: 5)")
     parser.add_argument('--max-attempts', type=int, default=50, help="Max attempts to generate unique mutations (default: 50)")
+    parser.add_argument('--mode', choices=['basic', 'llm_only'], default='basic', help="Fuzzing mode: 'basic' (token mutation) or 'llm_only' (LLM generation)")
     parser.add_argument('--print', action='store_true', help="Print mutations to console instead of writing to files")
     parser.add_argument('--verbose', action='store_true', help="Enable verbose output")
     
@@ -1044,7 +1042,7 @@ def main():
             continue
 
     #FUZZING LOOP
-    fuzzing_loop()
+    fuzzing_loop(args.mode, args.target_count, args.max_attempts)
 
     export_all_logs()
     write_overall_stats()
