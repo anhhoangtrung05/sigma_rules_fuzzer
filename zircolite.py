@@ -96,7 +96,7 @@ class ZircoliteAgent:
                 cmd = [
                 'python',
                 self.zircolite_path,
-                '-c', 'C:\BKCS\Zircolite\config\config.yaml',
+                '-c', 'C:\\Users\\bkcs\\purple_fuzz_mutator_dev\\Zircolite\\config\\config.yaml',
                 '-e', events_file,
                 '-r', self.rules_dir,
                 #'-sr',
