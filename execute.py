@@ -1,12 +1,11 @@
 import subprocess
 import os
 from typing import List, Dict
+import datetime
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-
 class ExecuteAgent:
     """
     Execute a batch of commands from output files.
@@ -42,28 +41,34 @@ class ExecuteAgent:
         }
         
         try:
+            start_time = datetime.datetime.utcnow()
             logger.info(f"Executing: {command}")
             
-            process = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
             )
-            result['return_code'] = process.returncode
-            result['stdout'] = process.stdout
-            result['stderr'] = process.stderr
             
-            #if process.stdout:
-                #logger.info(f"STDOUT:\n{process.stdout}")
-            #if process.stderr:
-                #logger.warning(f"STDERR:\n{process.stderr}")
-            
-            logger.info(f"Return code: {process.returncode}\n")
+            try:
+                stdout, stderr = process.communicate(timeout=self.timeout)
+                result['return_code'] = process.returncode
+                result['stdout'] = stdout
+                result['stderr'] = stderr
+                result['start_time'] = start_time
                 
-        except subprocess.TimeoutExpired:
-            logger.error(f"Command timed out after {self.timeout}s\n")
+                #if stdout:
+                    #logger.info(f"STDOUT:\n{stdout}")
+                #if stderr:
+                    #logger.warning(f"STDERR:\n{stderr}")
+                
+                logger.info(f"Return code: {process.returncode}\n")
+                
+            except subprocess.TimeoutExpired:
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], capture_output=True)
+                logger.error(f"Command timed out after {self.timeout}s\n")
             
         except Exception as e:
             logger.error(f"Execution error: {e}\n")

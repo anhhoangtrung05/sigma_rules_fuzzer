@@ -1,0 +1,26 @@
+2026-05-15 11:01:20 INFO     [+] Loading ruleset(s)
+2026-05-15 11:01:20 INFO     [cyan]    [>] Converting Native Sigma to Zircolite ruleset : c:\BKCS\purplefuzz_mutator_dev\windows_process_creation[/]
+2026-05-15 11:01:29 INFO     [+] 1128 rules loaded
+2026-05-15 11:01:29 INFO     [+] Checking prerequisites
+2026-05-15 11:01:29 INFO     [+] Auto-detected log type: [cyan]windows_evtx[/] ([yellow]evtx[/]) - confidence: [green]high[/]
+2026-05-15 11:01:29 INFO     [+] Auto-detected timestamp field: [cyan]SystemTime[/]
+2026-05-15 11:01:29 INFO     [+] Processing [yellow]1[/] file(s) separately in streaming mode
+2026-05-15 11:01:29 INFO     [+] Processing file: [cyan]Microsoft-Windows-Sysmon%4Operational.evtx[/]
+2026-05-15 11:01:29 INFO     [+] Processing events (streaming mode)
+2026-05-15 11:01:30 INFO     [+] Creating dynamic model
+2026-05-15 11:01:34 INFO     [+] Creating indexes
+2026-05-15 11:01:34 INFO     [+] Total events processed: [magenta]56,552[/]
+2026-05-15 11:01:34 INFO     [+] Executing ruleset for [cyan]Microsoft-Windows-Sysmon%4Operational.evtx[/] - [yellow]1128[/] rules
+2026-05-15 11:29:08 INFO     [+] Loading ruleset(s)
+2026-05-15 11:29:08 INFO     [cyan]    [>] Converting Native Sigma to Zircolite ruleset : c:\BKCS\purplefuzz_mutator_dev\windows_process_creation[/]
+2026-05-15 11:29:19 INFO     [+] 1128 rules loaded
+2026-05-15 11:29:19 INFO     [+] Checking prerequisites
+2026-05-15 11:29:19 INFO     [+] Auto-detected log type: [cyan]windows_evtx[/] ([yellow]evtx[/]) - confidence: [green]high[/]
+2026-05-15 11:29:19 INFO     [+] Auto-detected timestamp field: [cyan]SystemTime[/]
+2026-05-15 11:29:19 INFO     [+] Processing [yellow]1[/] file(s) separately in streaming mode
+2026-05-15 11:29:19 INFO     [+] Processing file: [cyan]Microsoft-Windows-Sysmon%4Operational.evtx[/]
+2026-05-15 11:29:19 INFO     [+] Processing events (streaming mode)
+2026-05-15 11:29:19 INFO     [+] Creating dynamic model
+2026-05-15 11:29:25 INFO     [+] Creating indexes
+2026-05-15 11:29:25 INFO     [+] Total events processed: [magenta]55,915[/]
+2026-05-15 11:29:25 INFO     [+] Executing ruleset for [cyan]Microsoft-Windows-Sysmon%4Operational.evtx[/] - [yellow]1128[/] rules

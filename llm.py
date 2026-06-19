@@ -202,7 +202,7 @@ def generate_json_with_model(exec_name, exec_list):
             response_text = response_text[:-3]
         
         original_data = json.loads(response_text)
-        data = original_data.get("response", {})
+        data = json.loads(original_data.get("response", {}))
         argument_dict = dict()
         switch_dict = dict()
         cmd_dict = dict()

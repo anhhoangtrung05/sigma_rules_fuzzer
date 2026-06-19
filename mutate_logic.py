@@ -38,6 +38,7 @@ def obfuscate_flag(flag):
     if not flag:
         return flag
     # Handle flags starting with - or /
+    prefix = ''
     if flag[0] in ['-', '/']:
         if flag[0] == '-':
             prefix = "/"
